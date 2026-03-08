@@ -1,0 +1,24 @@
+{
+  "dependencies": {
+    "@types/jszip": "^3.4.0",
+    "jszip": "^3.10.1",
+    "three": "^0.183.2"
+  },
+  "name": "mohaa-viewer",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "devDependencies": {
+    "@types/three": "^0.183.1",
+    "puppeteer": "^24.38.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
