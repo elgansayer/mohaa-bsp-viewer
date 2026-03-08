@@ -1,4 +1,4 @@
-# MOHAA Viewer
+# MOHAA BSP Viewer
 
 A web-based viewer for Medal of Honor: Allied Assault (MOHAA) assets.
 
