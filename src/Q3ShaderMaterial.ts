@@ -543,19 +543,30 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
 
     // Find environment overlay: an env/environmentmodel stage separate from the diffuse.
     // Vehicle shaders use stage 0 as reflection (env) and stage 1 as body texture (diffuse).
+    // In Q3, stage 0 renders first (env reflection), then stage 1 renders on top (body)
+    // with its blendFunc compositing via the GPU framebuffer blend.
     const envOverlayStage = findEnvOverlayStage(parsedShader, diffuseStage);
     const envMapUniform: { value: THREE.Texture } | null = envOverlayStage ? { value: getWhiteTexture() } : null;
+    // Flag to skip blending until the env texture actually loads (avoids white placeholder artifacts)
+    const envReadyUniform: { value: number } | null = envOverlayStage ? { value: 0.0 } : null;
     if (envOverlayStage?.map) {
         loadTexture(vfs, envOverlayStage.map).then(tex => {
-            if (tex && envMapUniform) {
+            if (tex && envMapUniform && envReadyUniform) {
                 envMapUniform.value = tex;
+                envReadyUniform.value = 1.0;
                 mat.needsUpdate = true;
             }
         });
     }
-    // When env overlay handles body-over-env compositing internally, override
-    // the material's blend mode to opaque (body stage's blendFunc is internal).
-    if (envOverlayStage) {
+    // Compute env stage alpha from alphaGen (e.g. alphaGen constant 0.05 for car windows)
+    let envAlpha = 1.0;
+    if (envOverlayStage?.alphaGen && typeof envOverlayStage.alphaGen !== 'string' &&
+        envOverlayStage.alphaGen.type === 'constant') {
+        envAlpha = envOverlayStage.alphaGen.args[0];
+    }
+    // Only force opaque if the env stage has NO blendFunc (opaque first pass in Q3).
+    // If the env stage has blendFunc (e.g. car windows), both stages are transparent.
+    if (envOverlayStage && !envOverlayStage.blendFunc) {
         mat.blending = THREE.NormalBlending;
         mat.transparent = false;
         mat.depthWrite = true;
@@ -613,8 +624,9 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
             let fragmentPreamble = '';
             if (envOverlayStage && envMapUniform) {
                 shader.uniforms.uEnvMap = envMapUniform;
+                shader.uniforms.uEnvReady = envReadyUniform!;
                 vertexPreamble += 'varying vec2 vEnvUv;\n';
-                fragmentPreamble += 'uniform sampler2D uEnvMap;\nvarying vec2 vEnvUv;\n';
+                fragmentPreamble += 'uniform sampler2D uEnvMap;\nuniform float uEnvReady;\nvarying vec2 vEnvUv;\n';
             }
             shader.vertexShader = vertexPreamble + shader.vertexShader;
             if (fragmentPreamble) {
@@ -707,24 +719,63 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
                     '#include <project_vertex>\n' + envUvCode
                 );
 
-                // Fragment: blend env overlay with body texture using body's alpha.
-                // Body stage blendFunc determines the compositing direction:
-                //   gl_one_minus_src_alpha/gl_src_alpha: result = body*(1-α) + env*α
-                //   blend (gl_src_alpha/gl_one_minus_src_alpha): result = body*α + env*(1-α)
+                // Fragment: blend env overlay with body texture following Q3 multi-pass order.
+                // In Q3, stage 0 (env) renders first, then stage 1 (body) renders on top.
+                // The body stage's blendFunc(srcFactor, dstFactor) composites:
+                //   output = body * srcFactor + framebuffer(env) * dstFactor
+                // We also apply the env stage's alphaGen (e.g. constant 0.05 for windows).
+                // A uEnvReady flag prevents blending with the white placeholder texture.
                 const bf = diffuseStage?.blendFunc;
                 const isInverseAlpha = bf && typeof bf !== 'string' &&
                     bf.src === 'gl_one_minus_src_alpha' && bf.dst === 'gl_src_alpha';
-                const blendGlsl = isInverseAlpha
-                    ? `{
-                        vec4 envC = texture2D(uEnvMap, vEnvUv);
-                        diffuseColor.rgb = diffuseColor.rgb * (1.0 - diffuseColor.a) + envC.rgb * diffuseColor.a;
-                        diffuseColor.a = 1.0;
-                    }`
-                    : `{
-                        vec4 envC = texture2D(uEnvMap, vEnvUv);
-                        diffuseColor.rgb = mix(envC.rgb, diffuseColor.rgb, diffuseColor.a);
+                const envAlphaLiteral = envAlpha.toFixed(6);
+                // Determine if env stage was opaque (no blendFunc → opaque first pass)
+                const envIsOpaque = !envOverlayStage.blendFunc;
+                let blendGlsl: string;
+                if (isInverseAlpha) {
+                    // blendFunc(ONE_MINUS_SRC_ALPHA, SRC_ALPHA):
+                    //   output = body*(1-body.a) + env*body.a
+                    blendGlsl = `{
+                        if (uEnvReady > 0.5) {
+                            vec4 envC = texture2D(uEnvMap, vEnvUv);
+                            #ifdef USE_COLOR
+                                envC.rgb *= vColor.rgb;
+                            #endif
+                            diffuseColor.rgb = diffuseColor.rgb * (1.0 - diffuseColor.a) + envC.rgb * ${envAlphaLiteral} * diffuseColor.a;
+                        }
                         diffuseColor.a = 1.0;
                     }`;
+                } else if (envIsOpaque) {
+                    // blendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA) with opaque env backdrop:
+                    //   output = body*body.a + env*(1-body.a), opaque result
+                    blendGlsl = `{
+                        if (uEnvReady > 0.5) {
+                            vec4 envC = texture2D(uEnvMap, vEnvUv);
+                            #ifdef USE_COLOR
+                                envC.rgb *= vColor.rgb;
+                            #endif
+                            diffuseColor.rgb = diffuseColor.rgb * diffuseColor.a + envC.rgb * ${envAlphaLiteral} * (1.0 - diffuseColor.a);
+                        }
+                        diffuseColor.a = 1.0;
+                    }`;
+                } else {
+                    // Both stages transparent (e.g. car windows).
+                    // Q3: stage 0 blends env*envAlpha onto background, stage 1 blends body on top.
+                    //   result.rgb = body*body.a + env*envAlpha*(1-body.a)
+                    //   result.a = body.a + envAlpha*(1-body.a)
+                    blendGlsl = `{
+                        if (uEnvReady > 0.5) {
+                            vec4 envC = texture2D(uEnvMap, vEnvUv);
+                            #ifdef USE_COLOR
+                                envC.rgb *= vColor.rgb;
+                            #endif
+                            float eA = ${envAlphaLiteral};
+                            float bodyA = diffuseColor.a;
+                            diffuseColor.rgb = diffuseColor.rgb * bodyA + envC.rgb * eA * (1.0 - bodyA);
+                            diffuseColor.a = bodyA + eA * (1.0 - bodyA);
+                        }
+                    }`;
+                }
                 shader.fragmentShader = shader.fragmentShader.replace(
                     '#include <map_fragment>',
                     '#include <map_fragment>\n' + blendGlsl
