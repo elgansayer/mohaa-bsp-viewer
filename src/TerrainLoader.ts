@@ -101,8 +101,6 @@ export function buildTerrainGeometry(
     const batches = new Map<string, TerrainBatch>();
 
     for (const patch of patches) {
-        if (patch.flags & 0x80) continue; // Hidden patch
-
         const shaderName = patch.shaderIndex < shaderNames.length ? shaderNames[patch.shaderIndex] : '';
         const key = `${shaderName.toLowerCase()}_lm${patch.lightmapIndex}`;
 
@@ -220,12 +218,23 @@ export function buildTerrainGeometry(
             shaderName: batch.shaderName,
             parsedShader: shaderParser.getShader(batch.shaderName),
             lightmapTexture: lmTex,
+            forceRepeatWrap: true, // Terrain UVs are tiling coordinates; ignore shader clampmap
         });
         allMaterials.push(q3mat);
 
         const mesh = new THREE.Mesh(geometry, q3mat.material);
         mesh.frustumCulled = false; // Terrain meshes span the whole map
         group.add(mesh);
+    }
+
+    // Debug: log first few terrain patches UV data
+    for (let i = 0; i < Math.min(3, patches.length); i++) {
+        const p = patches[i];
+        const sn = p.shaderIndex < shaderNames.length ? shaderNames[p.shaderIndex] : '?';
+        console.log(`[TerrainUV] patch ${i}: shader="${sn}" lm=${p.lightmapIndex} flags=0x${p.flags.toString(16)} scale=${p.scale} x=${p.x} y=${p.y} baseZ=${p.baseZ}`);
+        console.log(`  texCoords: [${p.texCoords.map(v => v.toFixed(4)).join(', ')}]`);
+        console.log(`  lmCoords: [${p.lmCoords.join(', ')}]`);
+        console.log(`  heightmap corners: [0,0]=${p.heightmap[0][0]} [0,8]=${p.heightmap[0][8]} [8,0]=${p.heightmap[8][0]} [8,8]=${p.heightmap[8][8]}`);
     }
 
     console.log(`Terrain: ${patches.length} patches batched into ${batches.size} draw calls`);

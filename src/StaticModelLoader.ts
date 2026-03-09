@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import { VirtualFileSystem } from './VirtualFileSystem';
 import { ShaderParser } from './ShaderParser';
 import { parseTiki, TikiDef } from './TikiParser';
-import { loadSkd, skdToStaticMeshes, getSkdStaticBakeStats, SkdModel, StaticMesh } from './SkdLoader';
+import { loadSkd, skdToStaticMeshes, getSkdStaticBakeStats, SkdModel, StaticMesh, loadSkc, BoneTransform } from './SkdLoader';
 import { createQ3Material, loadTexture } from './Q3ShaderMaterial';
 
 interface StaticModelDef {
@@ -19,6 +19,7 @@ interface StaticModelDef {
 // Cache loaded TIKIs and SKDs
 const tikiCache = new Map<string, TikiDef | null>();
 const skdCache = new Map<string, SkdModel | null>();
+const skcCache = new Map<string, ArrayBuffer | null>();
 
 
 function getStaticDebugMaterialEnabled(): boolean {
@@ -202,6 +203,22 @@ async function loadModelTemplate(
 
         if (!skdModel) continue;
 
+        // Load SKC animation for rest-pose bone transforms
+        let boneTransforms: Map<number, BoneTransform> | null = null;
+        if (tiki.firstSkcPath) {
+            const skcKey = tiki.firstSkcPath.toLowerCase();
+            let skcBuffer: ArrayBuffer | null | undefined;
+            if (skcCache.has(skcKey)) {
+                skcBuffer = skcCache.get(skcKey);
+            } else {
+                skcBuffer = await vfs.getFile(tiki.firstSkcPath) ?? null;
+                skcCache.set(skcKey, skcBuffer);
+            }
+            if (skcBuffer) {
+                boneTransforms = loadSkc(skcBuffer, skdModel);
+            }
+        }
+
         const bakeStats = getSkdStaticBakeStats(skdModel);
         if (bakeStats.multiWeightVerts > 0 || bakeStats.zeroWeightVerts > 0) {
             console.log('SKD static bake stats:', {
@@ -212,7 +229,7 @@ async function loadModelTemplate(
             });
         }
 
-        const staticMeshes = skdToStaticMeshes(skdModel);
+        const staticMeshes = skdToStaticMeshes(skdModel, boneTransforms);
 
         for (const staticMesh of staticMeshes) {
             const geometry = new THREE.BufferGeometry();

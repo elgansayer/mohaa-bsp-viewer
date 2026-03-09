@@ -10,20 +10,15 @@ const tgaLoader = new TGALoader();
 const texLoader = new THREE.TextureLoader();
 
 // In WebGL2, UNPACK_FLIP_Y_WEBGL is silently ignored for typed-array uploads
-// (texSubImage2D with ArrayBufferView). The TGALoader sets flipY=true intending
-// the GPU to flip on upload, but that never happens in WebGL2. Manually flip
-// the scanlines so that row-0 = bottom-of-image (OpenGL / Q3 UV V=0=bottom).
-function flipTextureY(data: Uint8Array, width: number, height: number): void {
-    const rowBytes = width * 4;
-    const tmp = new Uint8Array(rowBytes);
-    for (let y = 0; y < (height >> 1); y++) {
-        const top = y * rowBytes;
-        const bot = (height - 1 - y) * rowBytes;
-        tmp.set(data.subarray(top, top + rowBytes));
-        data.copyWithin(top, bot, bot + rowBytes);
-        data.set(tmp, bot);
-    }
-}
+// (texSubImage2D with ArrayBufferView).  The TGALoader returns data in
+// top-to-bottom order (web convention) with flipY=true, but since the GPU
+// flag is ignored for typed arrays the data stays top-to-bottom in VRAM.
+// With flipY=false, row-0 goes to the texture bottom (V=0), so V=0 maps to
+// the image TOP.  This matches Q3/MOHAA convention: the openmohaa TGA loader
+// reads rows in reverse order producing top-to-bottom memory, and
+// glTexImage2D maps row-0 to texture-bottom, giving V=0 = image-top.
+// Therefore we do NOT flip the scanlines — the raw TGALoader output already
+// has the correct layout for Q3 UVs.
 
 // Texture cache
 const textureCache = new Map<string, THREE.Texture | null>();
@@ -122,6 +117,8 @@ export async function loadTexture(vfs: VirtualFileSystem, path: string): Promise
             const blob = new Blob([res.buffer]);
             const url = URL.createObjectURL(blob);
             texture = await texLoader.loadAsync(url);
+            // Match Q3 convention: V=0 = image top.  With flipY=false the
+            // first image row (top) goes to texture-bottom (V=0).
             texture.flipY = false;
             URL.revokeObjectURL(url);
         }
@@ -312,9 +309,12 @@ function findDiffuseStage(shader: ParsedShader): ShaderStage | null {
             return stage;
         }
         if (stage.map && stage.map.toLowerCase() !== '$lightmap') {
-            // Skip pure environment/reflection stages as diffuse (they have no base texture)
-            const isEnvOnly = stage.tcGen === 'environment' && !stage.blendFunc;
-            if (isEnvOnly) {
+            // Skip environment/reflection stages as diffuse (they have no base texture).
+            // MOHAA vehicles use tcGen environmentmodel for reflections overlaid
+            // with the actual body texture in a later stage.
+            const tcg = stage.tcGen?.toLowerCase() || '';
+            const isEnvStage = tcg === 'environment' || tcg === 'environmentmodel';
+            if (isEnvStage) {
                 // Keep as fallback only if nothing else found
                 if (!envFallback) envFallback = stage;
                 continue;
@@ -323,6 +323,20 @@ function findDiffuseStage(shader: ParsedShader): ShaderStage | null {
         }
     }
     return envFallback;
+}
+
+// Find an environment overlay stage (env stage that was NOT selected as diffuse).
+// Vehicle shaders use tcGen environment/environmentmodel for reflection overlays
+// rendered beneath the body texture, blended via the body's alpha channel.
+function findEnvOverlayStage(shader: ParsedShader, diffuseStage: ShaderStage | null): ShaderStage | null {
+    for (const stage of shader.stages) {
+        if (stage === diffuseStage) continue;
+        const tcg = stage.tcGen?.toLowerCase() || '';
+        if ((tcg === 'environment' || tcg === 'environmentmodel') && stage.map) {
+            return stage;
+        }
+    }
+    return null;
 }
 
 // Check if the shader uses a lightmap (either as a separate stage or via nextbundle)
@@ -370,6 +384,7 @@ export interface CreateMaterialOptions {
     parsedShader: ParsedShader | undefined;
     lightmapTexture: THREE.Texture | null;
     vertexColors?: boolean;
+    forceRepeatWrap?: boolean;
 }
 
 // All Q3 wave functions approximated with sin() for GLSL injection simplicity.
@@ -390,7 +405,7 @@ export function logCullStats() {
 }
 
 export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
-    const { vfs, shaderName, parsedShader, lightmapTexture, vertexColors } = opts;
+    const { vfs, shaderName, parsedShader, lightmapTexture, vertexColors, forceRepeatWrap } = opts;
 
     // No shader definition found - create a simple textured material
     if (!parsedShader) {
@@ -524,7 +539,27 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
     // Apply deformVertexes via onBeforeCompile (vertex shader injection)
     const timeUniform = { value: 0.0 };
     const hasDeform = parsedShader.deformVertexes && parsedShader.deformVertexes.length > 0;
-    const hasTcGenEnv = diffuseStage?.tcGen === 'environment';
+    const hasTcGenEnv = diffuseStage?.tcGen === 'environment' || diffuseStage?.tcGen === 'environmentmodel';
+
+    // Find environment overlay: an env/environmentmodel stage separate from the diffuse.
+    // Vehicle shaders use stage 0 as reflection (env) and stage 1 as body texture (diffuse).
+    const envOverlayStage = findEnvOverlayStage(parsedShader, diffuseStage);
+    const envMapUniform: { value: THREE.Texture } | null = envOverlayStage ? { value: getWhiteTexture() } : null;
+    if (envOverlayStage?.map) {
+        loadTexture(vfs, envOverlayStage.map).then(tex => {
+            if (tex && envMapUniform) {
+                envMapUniform.value = tex;
+                mat.needsUpdate = true;
+            }
+        });
+    }
+    // When env overlay handles body-over-env compositing internally, override
+    // the material's blend mode to opaque (body stage's blendFunc is internal).
+    if (envOverlayStage) {
+        mat.blending = THREE.NormalBlending;
+        mat.transparent = false;
+        mat.depthWrite = true;
+    }
 
     // Load diffuse texture
     // For tcGen environment or deformVertexes, set a placeholder texture first so
@@ -543,7 +578,7 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
                     );
                     const finalTex = hasStaticTcMod ? tex.clone() : tex;
                     applyStaticTcMod(finalTex, diffuseStage);
-                    if (diffuseStage.clamp) {
+                    if (diffuseStage.clamp && !forceRepeatWrap) {
                         finalTex.wrapS = THREE.ClampToEdgeWrapping;
                         finalTex.wrapT = THREE.ClampToEdgeWrapping;
                     }
@@ -571,15 +606,20 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
         });
     }
 
-    if (hasDeform || hasTcGenEnv) {
+    if (hasDeform || hasTcGenEnv || envOverlayStage) {
         mat.onBeforeCompile = (shader) => {
             shader.uniforms.uTime = timeUniform;
-            // MeshBasicMaterial provides `normal` if we request normals, but it's not guaranteed.
-            // We use `#ifndef` but WebGL compiler might fail if it's already there without the define.
-            // However, `normal` is natively available in Three.js vertex shaders.
-            shader.vertexShader =
-                'uniform float uTime;\n' +
-                shader.vertexShader;
+            let vertexPreamble = 'uniform float uTime;\n';
+            let fragmentPreamble = '';
+            if (envOverlayStage && envMapUniform) {
+                shader.uniforms.uEnvMap = envMapUniform;
+                vertexPreamble += 'varying vec2 vEnvUv;\n';
+                fragmentPreamble += 'uniform sampler2D uEnvMap;\nvarying vec2 vEnvUv;\n';
+            }
+            shader.vertexShader = vertexPreamble + shader.vertexShader;
+            if (fragmentPreamble) {
+                shader.fragmentShader = fragmentPreamble + shader.fragmentShader;
+            }
 
             // Inject deformVertexes into vertex shader
             // Note: MeshBasicMaterial doesn't have objectNormal by default,
@@ -640,6 +680,54 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
                         vec3 viewNormal = normalize(mat3(modelViewMatrix) * normal);
                         vMapUv = vec2(0.5 + viewNormal.x * 0.5, 0.5 + viewNormal.y * 0.5);
                     }`
+                );
+            }
+
+            // Inject env overlay: compute separate env UVs and blend in fragment shader.
+            // environmentmodel uses viewer direction when the normal faces the camera,
+            // reflection otherwise. Standard environment always reflects.
+            if (envOverlayStage) {
+                const isEnvModel = envOverlayStage.tcGen?.toLowerCase() === 'environmentmodel';
+                const envUvCode = isEnvModel
+                    ? `{
+                        vec3 eViewDir = normalize(-mvPosition.xyz);
+                        vec3 eNorm = normalize(normalMatrix * normal);
+                        float eD = dot(eNorm, eViewDir);
+                        vec3 eRefl = eD > 0.0 ? eViewDir : eNorm * (-2.0 * eD) + eViewDir;
+                        vEnvUv = vec2(0.5 + eRefl.x * 0.5, 0.5 - eRefl.y * 0.5);
+                    }`
+                    : `{
+                        vec3 eViewDir = normalize(mvPosition.xyz);
+                        vec3 eNorm = normalize(normalMatrix * normal);
+                        vec3 eRefl = reflect(eViewDir, eNorm);
+                        vEnvUv = vec2(0.5 + eRefl.x * 0.5, 0.5 - eRefl.y * 0.5);
+                    }`;
+                shader.vertexShader = shader.vertexShader.replace(
+                    '#include <project_vertex>',
+                    '#include <project_vertex>\n' + envUvCode
+                );
+
+                // Fragment: blend env overlay with body texture using body's alpha.
+                // Body stage blendFunc determines the compositing direction:
+                //   gl_one_minus_src_alpha/gl_src_alpha: result = body*(1-α) + env*α
+                //   blend (gl_src_alpha/gl_one_minus_src_alpha): result = body*α + env*(1-α)
+                const bf = diffuseStage?.blendFunc;
+                const isInverseAlpha = bf && typeof bf !== 'string' &&
+                    bf.src === 'gl_one_minus_src_alpha' && bf.dst === 'gl_src_alpha';
+                const blendGlsl = isInverseAlpha
+                    ? `{
+                        vec4 envC = texture2D(uEnvMap, vEnvUv);
+                        diffuseColor.rgb = diffuseColor.rgb * (1.0 - diffuseColor.a) + envC.rgb * diffuseColor.a;
+                        diffuseColor.a = 1.0;
+                    }`
+                    : `{
+                        vec4 envC = texture2D(uEnvMap, vEnvUv);
+                        diffuseColor.rgb = mix(envC.rgb, diffuseColor.rgb, diffuseColor.a);
+                        diffuseColor.a = 1.0;
+                    }`;
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <map_fragment>',
+                    '#include <map_fragment>\n' + blendGlsl
                 );
             }
         };
@@ -906,14 +994,16 @@ export async function loadSkybox(
 
     const farbox = skyShader.skyParms.farbox;
     // Three.js CubeTexture face order: [+X, -X, +Y, -Y, +Z, -Z]
-    // After the world group rotation.x = -PI/2 (Q3 Z-up → Three.js Y-up):
-    //   Q3 +X → Three.js +X (face 0 = _rt)
-    //   Q3 -X → Three.js -X (face 1 = _lf)
-    //   Q3 +Z → Three.js +Y (face 2 = _up)
-    //   Q3 -Z → Three.js -Y (face 3 = _dn)
-    //   Q3 -Y → Three.js +Z (face 4 = _ft, since looking +Z = looking backward in Q3 = seeing front face)
-    //   Q3 +Y → Three.js -Z (face 5 = _bk, since camera forward -Z = Q3 +Y = back face)
-    const suffixes = ['_rt', '_lf', '_up', '_dn', '_ft', '_bk'];
+    // Q3 Z-up → Three.js Y-up coordinate mapping (rotation x=-PI/2):
+    //   Q3 +X → Three.js +X  (face 0 = _rt)
+    //   Q3 -X → Three.js -X  (face 1 = _lf)
+    //   Q3 +Z → Three.js +Y  (face 2 = _up, needs 90° CCW rotation)
+    //   Q3 -Z → Three.js -Y  (face 3 = _dn, needs 90° CW rotation)
+    //   Q3 +Y → Three.js +Z  (face 4 = _bk)
+    //   Q3 -Y → Three.js -Z  (face 5 = _ft)
+    // The _up/_dn face rotations compensate for the axis swap between
+    // Q3's st_to_vec encoding and the WebGL cubemap +Y/-Y face convention.
+    const suffixes = ['_rt', '_lf', '_up', '_dn', '_bk', '_ft'];
 
     const faces: THREE.Texture[] = [];
     for (const suffix of suffixes) {
@@ -926,33 +1016,52 @@ export async function loadSkybox(
     const cubeTexture = new THREE.CubeTexture();
     const images: any[] = [];
 
-    for (const face of faces) {
-        if (face.image) {
-            if (face instanceof THREE.DataTexture) {
-                // Convert DataTexture to canvas
-                const canvas = document.createElement('canvas');
-                canvas.width = face.image.width;
-                canvas.height = face.image.height;
-                const ctx = canvas.getContext('2d')!;
-                const imgData = ctx.createImageData(canvas.width, canvas.height);
+    for (let fi = 0; fi < faces.length; fi++) {
+        const face = faces[fi];
+        if (!face.image) continue;
 
-                const src = face.image.data as Uint8Array;
-                if (src.length === canvas.width * canvas.height * 3) {
-                    for (let i = 0, j = 0; i < src.length; i += 3, j += 4) {
-                        imgData.data[j] = src[i];
-                        imgData.data[j + 1] = src[i + 1];
-                        imgData.data[j + 2] = src[i + 2];
-                        imgData.data[j + 3] = 255;
-                    }
-                } else {
-                    imgData.data.set(src);
+        let canvas: HTMLCanvasElement;
+        if (face instanceof THREE.DataTexture) {
+            canvas = document.createElement('canvas');
+            canvas.width = face.image.width;
+            canvas.height = face.image.height;
+            const ctx = canvas.getContext('2d')!;
+            const imgData = ctx.createImageData(canvas.width, canvas.height);
+            const src = face.image.data as Uint8Array;
+            if (src.length === canvas.width * canvas.height * 3) {
+                for (let i = 0, j = 0; i < src.length; i += 3, j += 4) {
+                    imgData.data[j] = src[i];
+                    imgData.data[j + 1] = src[i + 1];
+                    imgData.data[j + 2] = src[i + 2];
+                    imgData.data[j + 3] = 255;
                 }
-                ctx.putImageData(imgData, 0, 0);
-                images.push(canvas);
             } else {
-                images.push(face.image);
+                imgData.data.set(src);
             }
+            ctx.putImageData(imgData, 0, 0);
+        } else {
+            const img = face.image as HTMLImageElement;
+            canvas = document.createElement('canvas');
+            canvas.width = img.width || img.naturalWidth;
+            canvas.height = img.height || img.naturalHeight;
+            const ctx = canvas.getContext('2d')!;
+            ctx.drawImage(img, 0, 0);
         }
+
+        // Rotate _up (face 2) 90° CCW and _dn (face 3) 90° CW
+        // to compensate for Q3 Z-up → Three.js Y-up axis swap
+        if (fi === 2 || fi === 3) {
+            const rotated = document.createElement('canvas');
+            rotated.width = canvas.width;
+            rotated.height = canvas.height;
+            const rctx = rotated.getContext('2d')!;
+            rctx.translate(canvas.width / 2, canvas.height / 2);
+            rctx.rotate(fi === 2 ? -Math.PI / 2 : Math.PI / 2);
+            rctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+            canvas = rotated;
+        }
+
+        images.push(canvas);
     }
 
     if (images.length === 6) {

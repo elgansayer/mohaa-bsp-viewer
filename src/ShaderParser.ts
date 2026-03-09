@@ -49,6 +49,10 @@ export interface ParsedShader {
 
 export class ShaderParser {
     private shaders: Map<string, ParsedShader> = new Map();
+    // Reverse index: texture path (from stage map directive) -> shader name
+    // Used to resolve BSP shader references like "textures/central_europe/carpet_fancy1"
+    // that map to shader definitions with short names like "carpet_fancy1"
+    private textureToShader: Map<string, string> = new Map();
 
     public parse(shaderText: string) {
         // Remove block comments /* ... */ and line comments // ...
@@ -144,6 +148,19 @@ export class ShaderParser {
             }
 
             this.shaders.set(shaderName, shader);
+
+            // Build reverse index: map texture paths to shader name
+            // This allows BSP references like "textures/foo/bar" to find
+            // shader definitions named "bar" whose stage uses "textures/foo/bar.tga"
+            for (const stage of shader.stages) {
+                if (stage.map && stage.map !== '$lightmap' && stage.map !== '$whiteimage' && stage.map !== '*white') {
+                    // Strip extension to get the texture path
+                    const texPath = stage.map.replace(/\.\w+$/, '').toLowerCase();
+                    if (texPath !== shaderName && !this.textureToShader.has(texPath)) {
+                        this.textureToShader.set(texPath, shaderName);
+                    }
+                }
+            }
         }
     }
 
@@ -333,7 +350,16 @@ export class ShaderParser {
     }
 
     public getShader(name: string): ParsedShader | undefined {
-        return this.shaders.get(name.toLowerCase());
+        const lower = name.toLowerCase();
+        const direct = this.shaders.get(lower);
+        if (direct) return direct;
+
+        // Fallback: BSP may reference the texture path (e.g. "textures/central_europe/carpet_fancy1")
+        // while the shader is defined with a short name (e.g. "carpet_fancy1")
+        const mapped = this.textureToShader.get(lower);
+        if (mapped) return this.shaders.get(mapped);
+
+        return undefined;
     }
 
     public getAllShaders(): Map<string, ParsedShader> {

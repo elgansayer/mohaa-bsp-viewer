@@ -69,6 +69,171 @@ export interface StaticMeshBakeStats {
     zeroWeightVerts: number;
 }
 
+// ---- SKC (Skeleton Animation) loader ----
+// Parses .skc files to extract rest-pose bone transforms (frame 0)
+// Based on openmohaa skeletor_animation_file_format.h
+
+const SKC_IDENT = 0x4E414B53; // "SKAN" in LE
+const SKC_VERSION_13 = 13;
+const SKC_VERSION_14 = 14;
+
+export interface BoneTransform {
+    // 3x3 rotation matrix (row-major)
+    matrix: [number, number, number, number, number, number, number, number, number];
+    offset: [number, number, number];
+}
+
+/**
+ * Load a .skc animation file and return per-bone transforms at frame 0.
+ * Matches openmohaa's TIKI_GetSkelAnimFrame + R_InitStaticModels vertex baking.
+ */
+export function loadSkc(buffer: ArrayBuffer, skdModel: SkdModel): Map<number, BoneTransform> | null {
+    const view = new DataView(buffer);
+    if (buffer.byteLength < 96) return null;
+
+    const ident = view.getUint32(0, true);
+    if (ident !== SKC_IDENT) return null;
+
+    const version = view.getInt32(4, true);
+    if (version !== SKC_VERSION_13 && version !== SKC_VERSION_14) return null;
+
+    const numChannels = view.getInt32(36, true);
+    const ofsChannelNames = view.getInt32(40, true);
+    const numFrames = view.getInt32(44, true);
+    if (numFrames < 1 || numChannels < 1) return null;
+
+    // Frame 0 channel data offset
+    const iOfsChannels = view.getInt32(92, true);
+
+    // Read channel names (32-byte null-padded strings)
+    const channels: { name: string; values: [number, number, number, number] }[] = [];
+    for (let c = 0; c < numChannels; c++) {
+        const nameOff = ofsChannelNames + c * 32;
+        let end = nameOff;
+        while (end < nameOff + 32 && end < buffer.byteLength && view.getUint8(end) !== 0) end++;
+        const name = new TextDecoder().decode(new Uint8Array(buffer, nameOff, end - nameOff));
+
+        const dataOff = iOfsChannels + c * 16;
+        const values: [number, number, number, number] = [
+            view.getFloat32(dataOff, true),
+            view.getFloat32(dataOff + 4, true),
+            view.getFloat32(dataOff + 8, true),
+            view.getFloat32(dataOff + 12, true),
+        ];
+        channels.push({ name, values });
+    }
+
+    // Build name → channel data maps  (case-insensitive)
+    const rotMap = new Map<string, [number, number, number, number]>();
+    const posMap = new Map<string, [number, number, number, number]>();
+    for (const ch of channels) {
+        const lower = ch.name.toLowerCase();
+        if (lower.endsWith(' rot')) {
+            rotMap.set(lower.slice(0, -4), ch.values);
+        } else if (lower.endsWith(' pos')) {
+            posMap.set(lower.slice(0, -4), ch.values);
+        }
+    }
+
+    // Resolve bone transforms in hierarchy order (parent before child).
+    // Engine: bone.GetTransform chains parent transforms.
+    // worldbone (implicit root) → identity.
+    // boneType 0 (Rotation): quat from anim, pos from SKD baseData
+    // boneType 1 (PosRot/Root): quat from anim, pos from anim
+    const boneTransforms = new Map<number, BoneTransform>();
+
+    // Implicit worldbone identity
+    const identityTransform: BoneTransform = {
+        matrix: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+        offset: [0, 0, 0],
+    };
+
+    // Process bones in hierarchy order (topological sort, parents first)
+    const processed = new Set<number>();
+    const resolve = (idx: number): BoneTransform => {
+        if (boneTransforms.has(idx)) return boneTransforms.get(idx)!;
+
+        const bone = skdModel.bones[idx];
+
+        // Get parent transform
+        let parentT = identityTransform;
+        if (bone.parent >= 0 && bone.parent < skdModel.bones.length) {
+            if (!processed.has(bone.parent)) resolve(bone.parent);
+            parentT = boneTransforms.get(bone.parent) ?? identityTransform;
+        }
+
+        // Get local rotation from animation (quaternion)
+        const boneNameLower = bone.name.toLowerCase();
+        const rotQuat = rotMap.get(boneNameLower);
+
+        // Get local position: boneType 1 = from anim, boneType 0 = from SKD baseData
+        let localPos: [number, number, number] = [0, 0, 0];
+        if (bone.boneType === 1) {
+            const posData = posMap.get(boneNameLower);
+            if (posData) localPos = [posData[0], posData[1], posData[2]];
+        } else if (bone.boneType === 0) {
+            // Rotation bone: position from baseData (already extracted)
+            localPos = [bone.offset[0], bone.offset[1], bone.offset[2]];
+        }
+
+        // Build local 3x3 matrix from quaternion
+        let lm: [number, number, number, number, number, number, number, number, number];
+        if (rotQuat) {
+            const [x, y, z, w] = rotQuat;
+            const x2 = x + x, y2 = y + y, z2 = z + z;
+            const xx = x * x2, xy = x * y2, xz = x * z2;
+            const yy = y * y2, yz = y * z2, zz = z * z2;
+            const wx = w * x2, wy = w * y2, wz = w * z2;
+            lm = [
+                1 - (yy + zz), xy - wz, xz + wy,
+                xy + wz, 1 - (xx + zz), yz - wx,
+                xz - wy, yz + wx, 1 - (xx + yy),
+            ];
+        } else {
+            lm = [1, 0, 0, 0, 1, 0, 0, 0, 1]; // identity
+        }
+
+        // Compose: worldTransform = localTransform * parentTransform
+        // Engine does: m_cachedValue.Multiply(incomingValue, m_parent->GetTransform())
+        // SkelMat4::Multiply(A, B) = A * B (matrix multiply)
+        // Result matrix = local_matrix * parent_matrix
+        // Result offset = local_pos * parent_matrix + parent_offset
+        const pm = parentT.matrix;
+        const po = parentT.offset;
+
+        const wm: [number, number, number, number, number, number, number, number, number] = [
+            lm[0] * pm[0] + lm[1] * pm[3] + lm[2] * pm[6],
+            lm[0] * pm[1] + lm[1] * pm[4] + lm[2] * pm[7],
+            lm[0] * pm[2] + lm[1] * pm[5] + lm[2] * pm[8],
+
+            lm[3] * pm[0] + lm[4] * pm[3] + lm[5] * pm[6],
+            lm[3] * pm[1] + lm[4] * pm[4] + lm[5] * pm[7],
+            lm[3] * pm[2] + lm[4] * pm[5] + lm[5] * pm[8],
+
+            lm[6] * pm[0] + lm[7] * pm[3] + lm[8] * pm[6],
+            lm[6] * pm[1] + lm[7] * pm[4] + lm[8] * pm[7],
+            lm[6] * pm[2] + lm[7] * pm[5] + lm[8] * pm[8],
+        ];
+
+        const wo: [number, number, number] = [
+            localPos[0] * pm[0] + localPos[1] * pm[3] + localPos[2] * pm[6] + po[0],
+            localPos[0] * pm[1] + localPos[1] * pm[4] + localPos[2] * pm[7] + po[1],
+            localPos[0] * pm[2] + localPos[1] * pm[5] + localPos[2] * pm[8] + po[2],
+        ];
+
+        const t: BoneTransform = { matrix: wm, offset: wo };
+        boneTransforms.set(idx, t);
+        processed.add(idx);
+        return t;
+    };
+
+    for (let i = 0; i < skdModel.bones.length; i++) {
+        resolve(i);
+    }
+
+    return boneTransforms;
+}
+
 function readString(view: DataView, offset: number, maxLen: number): string {
     let end = offset;
     while (end < offset + maxLen && view.getUint8(end) !== 0) end++;
@@ -281,8 +446,11 @@ export function loadSkd(buffer: ArrayBuffer): SkdModel | null {
 }
 
 // Convert SKD model to static mesh data (for BSP static models)
-// Match openmohaa static bake path: use the first weight entry for static xyz.
-export function skdToStaticMeshes(model: SkdModel): StaticMesh[] {
+// Match openmohaa static bake path:
+//   pos = (weight.offset * bone.matrix + bone.offset) * boneWeight
+// When boneTransforms is provided (from SKC), applies full bone rotation.
+// Without it, falls back to additive offsets only.
+export function skdToStaticMeshes(model: SkdModel, boneTransforms?: Map<number, BoneTransform> | null): StaticMesh[] {
     const meshes: StaticMesh[] = [];
 
     for (const surface of model.surfaces) {
@@ -295,23 +463,45 @@ export function skdToStaticMeshes(model: SkdModel): StaticMesh[] {
 
             const first = vert.weights[0];
             if (first) {
-                const bone = model.bones[first.boneIndex];
-                const bx = bone ? bone.worldOffset[0] : 0;
-                const by = bone ? bone.worldOffset[1] : 0;
-                const bz = bone ? bone.worldOffset[2] : 0;
+                const bt = boneTransforms?.get(first.boneIndex);
+                if (bt) {
+                    // Engine path: pos = (weight.offset * bone.matrix + bone.offset) * boneWeight
+                    const wx = first.offset[0], wy = first.offset[1], wz = first.offset[2];
+                    const m = bt.matrix;
+                    positions[i * 3]     = (wx * m[0] + wy * m[3] + wz * m[6] + bt.offset[0]) * first.boneWeight;
+                    positions[i * 3 + 1] = (wx * m[1] + wy * m[4] + wz * m[7] + bt.offset[1]) * first.boneWeight;
+                    positions[i * 3 + 2] = (wx * m[2] + wy * m[5] + wz * m[8] + bt.offset[2]) * first.boneWeight;
+                } else {
+                    // Fallback: additive offsets (no rotation)
+                    const bone = model.bones[first.boneIndex];
+                    const bx = bone ? bone.worldOffset[0] : 0;
+                    const by = bone ? bone.worldOffset[1] : 0;
+                    const bz = bone ? bone.worldOffset[2] : 0;
 
-                positions[i * 3] = (first.offset[0] + bx) * first.boneWeight;
-                positions[i * 3 + 1] = (first.offset[1] + by) * first.boneWeight;
-                positions[i * 3 + 2] = (first.offset[2] + bz) * first.boneWeight;
+                    positions[i * 3] = (first.offset[0] + bx) * first.boneWeight;
+                    positions[i * 3 + 1] = (first.offset[1] + by) * first.boneWeight;
+                    positions[i * 3 + 2] = (first.offset[2] + bz) * first.boneWeight;
+                }
             } else {
                 positions[i * 3] = 0;
                 positions[i * 3 + 1] = 0;
                 positions[i * 3 + 2] = 0;
             }
 
-            normals[i * 3] = vert.normal[0];
-            normals[i * 3 + 1] = vert.normal[1];
-            normals[i * 3 + 2] = vert.normal[2];
+            // Also rotate normals by bone matrix if available
+            const nFirst = vert.weights[0];
+            const nBt = nFirst ? boneTransforms?.get(nFirst.boneIndex) : undefined;
+            if (nBt) {
+                const nx = vert.normal[0], ny = vert.normal[1], nz = vert.normal[2];
+                const m = nBt.matrix;
+                normals[i * 3]     = nx * m[0] + ny * m[3] + nz * m[6];
+                normals[i * 3 + 1] = nx * m[1] + ny * m[4] + nz * m[7];
+                normals[i * 3 + 2] = nx * m[2] + ny * m[5] + nz * m[8];
+            } else {
+                normals[i * 3] = vert.normal[0];
+                normals[i * 3 + 1] = vert.normal[1];
+                normals[i * 3 + 2] = vert.normal[2];
+            }
 
             uvs[i * 2] = vert.texCoords[0];
             uvs[i * 2 + 1] = vert.texCoords[1];

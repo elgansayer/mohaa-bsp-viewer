@@ -22,6 +22,7 @@ export interface TikiDef {
     lightOffset: [number, number, number];
     radius: number;
     isCharacter: boolean;
+    firstSkcPath: string;     // first animation .skc file path (for rest-pose bone transforms)
 }
 
 export async function parseTiki(vfs: VirtualFileSystem, tikiPath: string): Promise<TikiDef | null> {
@@ -85,6 +86,7 @@ async function parseTikiText(text: string, tikiPath: string, vfs: VirtualFileSys
         lightOffset: [0, 0, 0],
         radius: 0,
         isCharacter: false,
+        firstSkcPath: '',
     };
 
     // Tokenize - handle // comments and quoted strings
@@ -123,8 +125,21 @@ async function parseTikiText(text: string, tikiPath: string, vfs: VirtualFileSys
             continue;
         }
 
-        if (token === 'animations' || token === 'init' || token === 'client' || token === 'server') {
+        if (token === 'init' || token === 'client' || token === 'server') {
+            inAnimations = false;
+            i++;
+            continue;
+        }
+
+        if (token === 'animations') {
             inAnimations = true;
+            i++;
+            continue;
+        }
+
+        // Capture first .skc animation path inside animations block
+        if (inAnimations && !def.firstSkcPath && /\.skc$/i.test(tokens[i])) {
+            def.firstSkcPath = resolveAssetPath(ensureTrailingSlash(basePath), currentPath, tokens[i]);
             i++;
             continue;
         }
@@ -286,6 +301,9 @@ async function parseTikiText(text: string, tikiPath: string, vfs: VirtualFileSys
                     if (included.scale !== 1.0) def.scale = included.scale;
                     if (included.origin[0] !== 0 || included.origin[1] !== 0 || included.origin[2] !== 0) {
                         def.origin = included.origin;
+                    }
+                    if (!def.firstSkcPath && included.firstSkcPath) {
+                        def.firstSkcPath = included.firstSkcPath;
                     }
                 }
             }
