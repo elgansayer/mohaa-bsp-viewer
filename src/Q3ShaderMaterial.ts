@@ -739,7 +739,7 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
                         if (uEnvReady > 0.5) {
                             vec4 envC = texture2D(uEnvMap, vEnvUv);
                             #ifdef USE_COLOR
-                                envC.rgb *= vColor.rgb;
+                                envC.rgb *= vColor;
                             #endif
                             diffuseColor.rgb = diffuseColor.rgb * (1.0 - diffuseColor.a) + envC.rgb * ${envAlphaLiteral} * diffuseColor.a;
                         }
@@ -752,7 +752,7 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
                         if (uEnvReady > 0.5) {
                             vec4 envC = texture2D(uEnvMap, vEnvUv);
                             #ifdef USE_COLOR
-                                envC.rgb *= vColor.rgb;
+                                envC.rgb *= vColor;
                             #endif
                             diffuseColor.rgb = diffuseColor.rgb * diffuseColor.a + envC.rgb * ${envAlphaLiteral} * (1.0 - diffuseColor.a);
                         }
@@ -767,7 +767,7 @@ export function createQ3Material(opts: CreateMaterialOptions): Q3Material {
                         if (uEnvReady > 0.5) {
                             vec4 envC = texture2D(uEnvMap, vEnvUv);
                             #ifdef USE_COLOR
-                                envC.rgb *= vColor.rgb;
+                                envC.rgb *= vColor;
                             #endif
                             float eA = ${envAlphaLiteral};
                             float bodyA = diffuseColor.a;
