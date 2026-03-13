@@ -1,9 +1,0 @@
-services:
-  mohaa-viewer:
-    image: ${IMAGE_NAME:-ghcr.io/owner/repo}:${IMAGE_TAG:-latest}
-    container_name: mohaa-viewer
-    restart: unless-stopped
-    environment:
-      PK3_BASE_URL: ${PK3_BASE_URL:-https://cdn.moh-central.net/main}
-    ports:
-      - "${PORT:-8080}:8080"
