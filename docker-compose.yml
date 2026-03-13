@@ -1,0 +1,15 @@
+services:
+  mohaa-viewer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mohaa-viewer:local
+    container_name: mohaa-viewer
+    restart: unless-stopped
+    environment:
+      PORT: ${PORT:-5173}
+      MOHAA_BASE_PATH: ${MOHAA_BASE_PATH:-/data/mohaa}
+    ports:
+      - "${PORT:-5173}:${PORT:-5173}"
+    volumes:
+      - ${MOHAA_HOST_PATH:-/path/to/your/mohaa-files}:/data/mohaa:ro
