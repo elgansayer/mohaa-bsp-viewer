@@ -1,16 +1,20 @@
-FROM node:20-alpine
+# Stage 1: Build
+FROM node:20-alpine AS build
 
 WORKDIR /app
-
 COPY package.json package-lock.json ./
 RUN npm ci
-
 COPY . .
+RUN npm run build
 
-# Runtime config: mount your MOHAA files and override as needed.
-ENV MOHAA_BASE_PATH=/data/mohaa
-ENV PORT=5173
+# Stage 2: Serve
+FROM nginx:alpine
 
-EXPOSE 5173
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
 
-CMD ["sh", "-c", "npm run dev -- --host 0.0.0.0 --port ${PORT:-5173}"]
+EXPOSE 8080
+
+ENTRYPOINT ["/docker-entrypoint.sh"]

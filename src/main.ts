@@ -304,6 +304,7 @@ const vfs = new VirtualFileSystem();
 const shaderParser = new ShaderParser();
 (window as any).__shaderParser = shaderParser;
 (window as any).__vfs = vfs;
+const PK3_BASE_URL = (window as any).__CONFIG__?.PK3_BASE_URL || 'https://cdn.moh-central.net/main';
 const PK3_FILES = [
     'Pak0.pk3', 'Pak1.pk3', 'Pak2.pk3', 'Pak3.pk3',
     'Pak4.pk3', 'Pak5.pk3', 'Pak6.pk3', 'Pak6EnUk.pk3', 'pak7.pk3'
@@ -316,7 +317,7 @@ async function initVFS() {
         const total = PK3_FILES.length;
         await Promise.all(PK3_FILES.map(async (pk3) => {
             try {
-                await vfs.loadPk3(`/@fs/home/elgan/mohaa-web-base/main/${pk3}`);
+                await vfs.loadPk3(`${PK3_BASE_URL}/${pk3}`);
             } catch (e) {
                 console.warn(`Failed to load ${pk3}:`, e);
             }

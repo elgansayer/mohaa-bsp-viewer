@@ -7,9 +7,6 @@ services:
     container_name: mohaa-viewer
     restart: unless-stopped
     environment:
-      PORT: ${PORT:-5173}
-      MOHAA_BASE_PATH: ${MOHAA_BASE_PATH:-/data/mohaa}
+      PK3_BASE_URL: ${PK3_BASE_URL:-https://cdn.moh-central.net/main}
     ports:
-      - "${PORT:-5173}:${PORT:-5173}"
-    volumes:
-      - ${MOHAA_HOST_PATH:-/path/to/your/mohaa-files}:/data/mohaa:ro
+      - "${PORT:-8080}:8080"
