@@ -423,12 +423,63 @@ async function handleDirectoryUpload(files: FileList) {
     }
 }
 
-async function initVFS() {
-    if (statusDiv) statusDiv.textContent = 'Loading PK3 archives from CDN...';
+function setupUploadUI() {
+    if (!inputContainer || document.getElementById('upload-section')) return;
 
-    // Try loading from CDN
-    let cdnLoaded = 0;
-    try {
+    const section = document.createElement('div');
+    section.id = 'upload-section';
+    section.style.marginTop = '16px';
+    section.style.padding = '12px';
+    section.style.border = '2px dashed #555';
+    section.style.borderRadius = '6px';
+
+    section.innerHTML = `
+        <div style="font-size:13px; color:#ccc; margin-bottom:10px; font-weight:bold;">Upload Game Files</div>
+        <div style="margin-bottom:10px;">
+            <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">PK3 files (select multiple):</label>
+            <input type="file" id="pk3-file-upload" accept=".pk3" multiple style="color:#aaa; font-size:12px; width:100%;" />
+        </div>
+        <div style="margin-bottom:10px;">
+            <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or select your MOHAA game folder:</label>
+            <input type="file" id="folder-upload" webkitdirectory directory style="color:#aaa; font-size:12px; width:100%;" />
+        </div>
+        <div>
+            <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or upload a single .bsp file:</label>
+            <input type="file" id="bsp-file-upload" accept=".bsp" style="color:#aaa; font-size:12px; width:100%;" />
+        </div>
+    `;
+    inputContainer.appendChild(section);
+
+    (document.getElementById('pk3-file-upload') as HTMLInputElement).onchange = async (e: any) => {
+        if (e.target.files?.length) await handleFileUploads(e.target.files);
+    };
+
+    (document.getElementById('folder-upload') as HTMLInputElement).onchange = async (e: any) => {
+        if (e.target.files?.length) await handleDirectoryUpload(e.target.files);
+    };
+
+    (document.getElementById('bsp-file-upload') as HTMLInputElement).onchange = async (e: any) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        inputContainer.style.display = 'none';
+        if (statusDiv) statusDiv.textContent = `Loading ${file.name}...`;
+        const buffer = await file.arrayBuffer();
+        loadBspBuffer(buffer, file.name);
+    };
+
+    // Remove the old pk3-upload-area if it exists
+    const oldPk3Area = document.getElementById('pk3-upload-area');
+    if (oldPk3Area) oldPk3Area.remove();
+}
+
+async function initVFS() {
+    // Show upload UI immediately
+    setupUploadUI();
+    if (statusDiv) statusDiv.textContent = 'Loading PK3 archives from CDN in background...';
+
+    // Load CDN in background — don't block the UI
+    const cdnPromise = (async () => {
+        let cdnLoaded = 0;
         let loaded = 0;
         const total = PK3_FILES.length;
         await Promise.all(PK3_FILES.map(async (pk3) => {
@@ -439,75 +490,22 @@ async function initVFS() {
                 console.warn(`Failed to load ${pk3}:`, e);
             }
             loaded++;
-            if (statusDiv) statusDiv.textContent = `Loading PK3 archives... (${loaded}/${total})`;
+            if (statusDiv) statusDiv.textContent = `Loading from CDN... (${loaded}/${total}) — upload files anytime`;
         }));
-    } catch (err) {
-        console.error('CDN loading failed:', err);
-    }
+        return cdnLoaded;
+    })();
 
-    if (cdnLoaded > 0) {
-        await parseAndShowMaps();
-    } else {
-        console.warn('No PK3 files loaded from CDN - showing upload UI');
-        if (statusDiv) statusDiv.textContent = 'CDN unavailable. Upload PK3 files, a game folder, or a .bsp file.';
-    }
-
-    // Set up upload UI (always visible)
-    if (inputContainer) {
-        // Build upload section if not already present
-        if (!document.getElementById('upload-section')) {
-            const section = document.createElement('div');
-            section.id = 'upload-section';
-            section.style.marginTop = '16px';
-            section.style.padding = '12px';
-            section.style.border = '2px dashed #555';
-            section.style.borderRadius = '6px';
-
-            section.innerHTML = `
-                <div style="font-size:13px; color:#ccc; margin-bottom:10px; font-weight:bold;">Upload Game Files</div>
-                <div style="margin-bottom:10px;">
-                    <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">PK3 files (select multiple):</label>
-                    <input type="file" id="pk3-file-upload" accept=".pk3" multiple style="color:#aaa; font-size:12px; width:100%;" />
-                </div>
-                <div style="margin-bottom:10px;">
-                    <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or select your MOHAA game folder:</label>
-                    <input type="file" id="folder-upload" webkitdirectory directory style="color:#aaa; font-size:12px; width:100%;" />
-                </div>
-                <div>
-                    <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or upload a single .bsp file:</label>
-                    <input type="file" id="bsp-file-upload" accept=".bsp" style="color:#aaa; font-size:12px; width:100%;" />
-                </div>
-            `;
-            inputContainer.appendChild(section);
-
-            // PK3 upload handler
-            const pk3Input = document.getElementById('pk3-file-upload') as HTMLInputElement;
-            pk3Input.onchange = async (e: any) => {
-                if (e.target.files?.length) await handleFileUploads(e.target.files);
-            };
-
-            // Directory upload handler
-            const folderInput = document.getElementById('folder-upload') as HTMLInputElement;
-            folderInput.onchange = async (e: any) => {
-                if (e.target.files?.length) await handleDirectoryUpload(e.target.files);
-            };
-
-            // BSP upload handler
-            const bspInput = document.getElementById('bsp-file-upload') as HTMLInputElement;
-            bspInput.onchange = async (e: any) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
-                inputContainer.style.display = 'none';
-                if (statusDiv) statusDiv.textContent = `Loading ${file.name}...`;
-                const buffer = await file.arrayBuffer();
-                loadBspBuffer(buffer, file.name);
-            };
+    cdnPromise.then(async (cdnLoaded) => {
+        if (cdnLoaded > 0) {
+            await parseAndShowMaps();
+        } else {
+            console.warn('No PK3 files loaded from CDN');
+            if (statusDiv) statusDiv.textContent = 'CDN unavailable. Upload PK3 files, a game folder, or a .bsp file.';
         }
-
-        // Remove the old pk3-upload-area if it exists
-        const oldPk3Area = document.getElementById('pk3-upload-area');
-        if (oldPk3Area) oldPk3Area.remove();
-    }
+    }).catch((err) => {
+        console.error('CDN loading failed:', err);
+        if (statusDiv) statusDiv.textContent = 'CDN failed. Upload PK3 files, a game folder, or a .bsp file.';
+    });
 }
 
 async function loadMap(mapPath: string) {
