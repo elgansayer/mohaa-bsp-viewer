@@ -3,6 +3,7 @@ import JSZip from 'jszip';
 export class VirtualFileSystem {
     private zips: JSZip[] = [];
     private fileMap: Map<string, { zip: JSZip, name: string }> = new Map();
+    private looseFiles: Map<string, { buffer: ArrayBuffer, name: string }> = new Map();
 
     async loadPk3(url: string) {
         console.log(`Loading PK3: ${url}`);
@@ -25,6 +26,11 @@ export class VirtualFileSystem {
 
     async getFile(path: string): Promise<ArrayBuffer | null> {
         const lowerPath = path.replace(/\\/g, '/').toLowerCase();
+
+        // Check loose files first (user uploads override pk3 contents)
+        const loose = this.looseFiles.get(lowerPath);
+        if (loose) return loose.buffer;
+
         const entry = this.fileMap.get(lowerPath);
         if (!entry) {
             return null;
@@ -64,13 +70,18 @@ export class VirtualFileSystem {
     }
 
     getMapList(): string[] {
-        const maps: string[] = [];
-        for (const key of this.fileMap.keys()) {
+        const maps = new Set<string>();
+        for (const [key, entry] of this.looseFiles.entries()) {
             if (key.startsWith('maps/') && key.endsWith('.bsp')) {
-                maps.push(this.fileMap.get(key)!.name);
+                maps.add(entry.name);
             }
         }
-        return maps;
+        for (const [key, entry] of this.fileMap.entries()) {
+            if (key.startsWith('maps/') && key.endsWith('.bsp')) {
+                maps.add(entry.name);
+            }
+        }
+        return Array.from(maps);
     }
 
     async loadPk3FromBuffer(buffer: ArrayBuffer, name: string) {
@@ -87,11 +98,16 @@ export class VirtualFileSystem {
     }
 
     hasFile(path: string): boolean {
-        return this.fileMap.has(path.toLowerCase());
+        const lower = path.toLowerCase();
+        return this.looseFiles.has(lower) || this.fileMap.has(lower);
     }
 
     async getTextFile(path: string): Promise<string | null> {
         const lowerPath = path.toLowerCase();
+
+        const loose = this.looseFiles.get(lowerPath);
+        if (loose) return new TextDecoder().decode(loose.buffer);
+
         const entry = this.fileMap.get(lowerPath);
         if (!entry) return null;
         const file = entry.zip.file(entry.name);
@@ -101,7 +117,18 @@ export class VirtualFileSystem {
 
     async getAllShaders(): Promise<string[]> {
         const shaderContents: string[] = [];
+        const seen = new Set<string>();
+
+        // Loose files first (overrides)
+        for (const [key, entry] of this.looseFiles.entries()) {
+            if (key.startsWith('scripts/') && key.endsWith('.shader')) {
+                shaderContents.push(new TextDecoder().decode(entry.buffer));
+                seen.add(key);
+            }
+        }
+
         for (const [key, entry] of this.fileMap.entries()) {
+            if (seen.has(key)) continue;
             if (key.startsWith('scripts/') && key.endsWith('.shader')) {
                 const file = entry.zip.file(entry.name);
                 if (file) {
@@ -111,5 +138,39 @@ export class VirtualFileSystem {
             }
         }
         return shaderContents;
+    }
+
+    addLooseFile(gamePath: string, buffer: ArrayBuffer) {
+        this.looseFiles.set(gamePath.toLowerCase(), { buffer, name: gamePath });
+    }
+
+    async loadLooseFiles(files: FileList | File[], stripPrefix?: string) {
+        let count = 0;
+        for (const file of files) {
+            // webkitRelativePath gives e.g. "main/maps/dm/mohdm1.bsp"
+            let relativePath = (file as any).webkitRelativePath || file.name;
+            relativePath = relativePath.replace(/\\/g, '/');
+
+            // Strip the top-level directory (the uploaded folder name)
+            if (stripPrefix) {
+                if (relativePath.toLowerCase().startsWith(stripPrefix.toLowerCase())) {
+                    relativePath = relativePath.substring(stripPrefix.length);
+                }
+            } else {
+                // Auto-strip first path segment
+                const slashIdx = relativePath.indexOf('/');
+                if (slashIdx >= 0) {
+                    relativePath = relativePath.substring(slashIdx + 1);
+                }
+            }
+
+            if (!relativePath || file.size === 0) continue;
+
+            const buffer = await file.arrayBuffer();
+            this.looseFiles.set(relativePath.toLowerCase(), { buffer, name: relativePath });
+            count++;
+        }
+        console.log(`Loaded ${count} loose files into VFS`);
+        return count;
     }
 }

@@ -406,20 +406,27 @@ async function handleDirectoryUpload(files: FileList) {
     // Sort so Pak files load in order
     const sorted = Array.from(files).sort((a, b) => a.name.localeCompare(b.name));
 
-    for (const file of sorted) {
-        const name = file.name.toLowerCase();
-        if (name.endsWith('.pk3')) {
+    // Check if any pk3 files exist in the folder
+    const pk3Files = sorted.filter(f => f.name.toLowerCase().endsWith('.pk3'));
+
+    if (pk3Files.length > 0) {
+        // Load pk3 files as before
+        for (const file of pk3Files) {
             if (statusDiv) statusDiv.textContent = `Loading ${file.name}...`;
             const buffer = await file.arrayBuffer();
             await vfs.loadPk3FromBuffer(buffer, file.name);
             pk3Count++;
         }
-    }
-
-    if (pk3Count > 0) {
         await parseAndShowMaps();
     } else {
-        if (statusDiv) statusDiv.textContent = 'No .pk3 files found in the selected folder.';
+        // No pk3s — load as loose files directly into VFS
+        if (statusDiv) statusDiv.textContent = `Loading ${files.length} loose files...`;
+        const count = await vfs.loadLooseFiles(sorted);
+        if (count > 0) {
+            await parseAndShowMaps();
+        } else {
+            if (statusDiv) statusDiv.textContent = 'No game files found in the selected folder.';
+        }
     }
 }
 
@@ -440,7 +447,7 @@ function setupUploadUI() {
             <input type="file" id="pk3-file-upload" accept=".pk3" multiple style="color:#aaa; font-size:12px; width:100%;" />
         </div>
         <div style="margin-bottom:10px;">
-            <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or select your MOHAA game folder:</label>
+            <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or select your MOHAA game folder (pk3s or extracted files):</label>
             <input type="file" id="folder-upload" webkitdirectory directory style="color:#aaa; font-size:12px; width:100%;" />
         </div>
         <div>
