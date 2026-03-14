@@ -310,114 +310,203 @@ const PK3_FILES = [
     'Pak4.pk3', 'Pak5.pk3', 'Pak6.pk3', 'Pak6EnUk.pk3', 'pak7.pk3'
 ];
 
-async function initVFS() {
-    if (statusDiv) statusDiv.textContent = 'Loading PK3 archives...';
-    try {
-        let loaded = 0;
-        const total = PK3_FILES.length;
-        await Promise.all(PK3_FILES.map(async (pk3) => {
-            try {
-                await vfs.loadPk3(`${PK3_BASE_URL}/${pk3}`);
-            } catch (e) {
-                console.warn(`Failed to load ${pk3}:`, e);
+async function parseAndShowMaps() {
+    if (statusDiv) statusDiv.textContent = 'Parsing shaders...';
+    const shaderContents = await vfs.getAllShaders();
+    for (const content of shaderContents) {
+        shaderParser.parse(content);
+    }
+    console.log(`Parsed ${shaderParser.getAllShaders().size} shaders`);
+
+    const maps = vfs.getMapList();
+    if (inputContainer) {
+        // Keep upload sections, rebuild map list area
+        let mapArea = document.getElementById('map-list-area');
+        if (!mapArea) {
+            mapArea = document.createElement('div');
+            mapArea.id = 'map-list-area';
+            // Insert before the upload sections
+            const uploadSection = document.getElementById('upload-section');
+            if (uploadSection) {
+                inputContainer.insertBefore(mapArea, uploadSection);
+            } else {
+                inputContainer.appendChild(mapArea);
             }
-            loaded++;
-            if (statusDiv) statusDiv.textContent = `Loading PK3 archives... (${loaded}/${total})`;
-        }));
-
-        // Parse shaders
-        if (statusDiv) statusDiv.textContent = 'Parsing shaders...';
-        const shaderContents = await vfs.getAllShaders();
-        for (const content of shaderContents) {
-            shaderParser.parse(content);
         }
-        console.log(`Parsed ${shaderParser.getAllShaders().size} shaders`);
+        mapArea.innerHTML = '';
 
-        const maps = vfs.getMapList();
-        if (inputContainer) {
-            inputContainer.innerHTML = '<h3>MOHAA Map Viewer</h3>';
-
+        if (maps.length > 0) {
             const select = document.createElement('select');
             select.style.width = '100%';
+            select.style.padding = '8px';
+            select.style.background = '#2a2f35';
+            select.style.color = '#eee';
+            select.style.border = '1px solid #555';
+            select.style.borderRadius = '4px';
             maps.sort().forEach(m => {
                 const opt = document.createElement('option');
                 opt.value = m;
                 opt.textContent = m;
                 select.appendChild(opt);
             });
-            inputContainer.appendChild(select);
+            mapArea.appendChild(select);
 
             const btn = document.createElement('button');
             btn.textContent = 'Load Map';
             btn.style.display = 'block';
+            btn.style.width = '100%';
             btn.style.marginTop = '10px';
             btn.onclick = async () => {
                 const mapPath = select.value;
                 inputContainer.style.display = 'none';
                 await loadMap(mapPath);
             };
-            inputContainer.appendChild(btn);
+            mapArea.appendChild(btn);
+        }
+    }
 
-            // File upload
-            const fileLabel = document.createElement('div');
-            fileLabel.textContent = 'Or upload a .bsp file:';
-            fileLabel.style.marginTop = '10px';
-            inputContainer.appendChild(fileLabel);
+    if (statusDiv) {
+        statusDiv.textContent = maps.length > 0
+            ? `Ready - ${maps.length} maps found. Select a map to load.`
+            : 'No maps loaded. Upload PK3 files, a folder, or a .bsp file below.';
+    }
+}
 
-            const fileInput = document.createElement('input');
-            fileInput.type = 'file';
-            fileInput.accept = '.bsp';
-            fileInput.onchange = async (e: any) => {
-                const file = e.target.files[0];
+async function handleFileUploads(files: FileList | File[]) {
+    let pk3Count = 0;
+    let bspFile: File | null = null;
+
+    for (const file of files) {
+        const name = file.name.toLowerCase();
+        if (name.endsWith('.pk3')) {
+            if (statusDiv) statusDiv.textContent = `Loading ${file.name}...`;
+            const buffer = await file.arrayBuffer();
+            await vfs.loadPk3FromBuffer(buffer, file.name);
+            pk3Count++;
+        } else if (name.endsWith('.bsp')) {
+            bspFile = file;
+        }
+    }
+
+    if (pk3Count > 0) {
+        await parseAndShowMaps();
+    }
+
+    // If a standalone BSP was uploaded (not inside a PK3), load it directly
+    if (bspFile && pk3Count === 0) {
+        if (inputContainer) inputContainer.style.display = 'none';
+        if (statusDiv) statusDiv.textContent = `Loading ${bspFile.name}...`;
+        const buffer = await bspFile.arrayBuffer();
+        loadBspBuffer(buffer, bspFile.name);
+    }
+}
+
+async function handleDirectoryUpload(files: FileList) {
+    let pk3Count = 0;
+    // Sort so Pak files load in order
+    const sorted = Array.from(files).sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const file of sorted) {
+        const name = file.name.toLowerCase();
+        if (name.endsWith('.pk3')) {
+            if (statusDiv) statusDiv.textContent = `Loading ${file.name}...`;
+            const buffer = await file.arrayBuffer();
+            await vfs.loadPk3FromBuffer(buffer, file.name);
+            pk3Count++;
+        }
+    }
+
+    if (pk3Count > 0) {
+        await parseAndShowMaps();
+    } else {
+        if (statusDiv) statusDiv.textContent = 'No .pk3 files found in the selected folder.';
+    }
+}
+
+async function initVFS() {
+    if (statusDiv) statusDiv.textContent = 'Loading PK3 archives from CDN...';
+
+    // Try loading from CDN
+    let cdnLoaded = 0;
+    try {
+        let loaded = 0;
+        const total = PK3_FILES.length;
+        await Promise.all(PK3_FILES.map(async (pk3) => {
+            try {
+                await vfs.loadPk3(`${PK3_BASE_URL}/${pk3}`);
+                cdnLoaded++;
+            } catch (e) {
+                console.warn(`Failed to load ${pk3}:`, e);
+            }
+            loaded++;
+            if (statusDiv) statusDiv.textContent = `Loading PK3 archives... (${loaded}/${total})`;
+        }));
+    } catch (err) {
+        console.error('CDN loading failed:', err);
+    }
+
+    if (cdnLoaded > 0) {
+        await parseAndShowMaps();
+    } else {
+        console.warn('No PK3 files loaded from CDN - showing upload UI');
+        if (statusDiv) statusDiv.textContent = 'CDN unavailable. Upload PK3 files, a game folder, or a .bsp file.';
+    }
+
+    // Set up upload UI (always visible)
+    if (inputContainer) {
+        // Build upload section if not already present
+        if (!document.getElementById('upload-section')) {
+            const section = document.createElement('div');
+            section.id = 'upload-section';
+            section.style.marginTop = '16px';
+            section.style.padding = '12px';
+            section.style.border = '2px dashed #555';
+            section.style.borderRadius = '6px';
+
+            section.innerHTML = `
+                <div style="font-size:13px; color:#ccc; margin-bottom:10px; font-weight:bold;">Upload Game Files</div>
+                <div style="margin-bottom:10px;">
+                    <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">PK3 files (select multiple):</label>
+                    <input type="file" id="pk3-file-upload" accept=".pk3" multiple style="color:#aaa; font-size:12px; width:100%;" />
+                </div>
+                <div style="margin-bottom:10px;">
+                    <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or select your MOHAA game folder:</label>
+                    <input type="file" id="folder-upload" webkitdirectory directory style="color:#aaa; font-size:12px; width:100%;" />
+                </div>
+                <div>
+                    <label style="font-size:12px; color:#aaa; display:block; margin-bottom:4px;">Or upload a single .bsp file:</label>
+                    <input type="file" id="bsp-file-upload" accept=".bsp" style="color:#aaa; font-size:12px; width:100%;" />
+                </div>
+            `;
+            inputContainer.appendChild(section);
+
+            // PK3 upload handler
+            const pk3Input = document.getElementById('pk3-file-upload') as HTMLInputElement;
+            pk3Input.onchange = async (e: any) => {
+                if (e.target.files?.length) await handleFileUploads(e.target.files);
+            };
+
+            // Directory upload handler
+            const folderInput = document.getElementById('folder-upload') as HTMLInputElement;
+            folderInput.onchange = async (e: any) => {
+                if (e.target.files?.length) await handleDirectoryUpload(e.target.files);
+            };
+
+            // BSP upload handler
+            const bspInput = document.getElementById('bsp-file-upload') as HTMLInputElement;
+            bspInput.onchange = async (e: any) => {
+                const file = e.target.files?.[0];
                 if (!file) return;
                 inputContainer.style.display = 'none';
                 if (statusDiv) statusDiv.textContent = `Loading ${file.name}...`;
                 const buffer = await file.arrayBuffer();
                 loadBspBuffer(buffer, file.name);
             };
-            inputContainer.appendChild(fileInput);
         }
 
-        // PK3 upload support
-        const pk3Upload = document.getElementById('pk3-upload') as HTMLInputElement;
-        const pk3Area = document.getElementById('pk3-upload-area');
-        if (pk3Upload && pk3Area) {
-            pk3Area.style.display = 'block';
-            pk3Upload.onchange = async (e: any) => {
-                const files = e.target.files;
-                if (!files || files.length === 0) return;
-
-                for (const file of files) {
-                    if (statusDiv) statusDiv.textContent = `Loading ${file.name}...`;
-                    const buffer = await file.arrayBuffer();
-                    await vfs.loadPk3FromBuffer(buffer, file.name);
-                }
-
-                const newShaders = await vfs.getAllShaders();
-                for (const content of newShaders) {
-                    shaderParser.parse(content);
-                }
-
-                const newMaps = vfs.getMapList();
-                const mapSelect = inputContainer?.querySelector('select');
-                if (mapSelect) {
-                    mapSelect.innerHTML = '';
-                    newMaps.sort().forEach(m => {
-                        const opt = document.createElement('option');
-                        opt.value = m;
-                        opt.textContent = m;
-                        mapSelect.appendChild(opt);
-                    });
-                }
-
-                if (statusDiv) statusDiv.textContent = `Ready - ${newMaps.length} maps found.`;
-            };
-        }
-
-        if (statusDiv) statusDiv.textContent = `Ready - ${maps.length} maps found. Select a map to load.`;
-    } catch (err) {
-        console.error(err);
-        if (statusDiv) statusDiv.textContent = `Error: ${err}`;
+        // Remove the old pk3-upload-area if it exists
+        const oldPk3Area = document.getElementById('pk3-upload-area');
+        if (oldPk3Area) oldPk3Area.remove();
     }
 }
 
